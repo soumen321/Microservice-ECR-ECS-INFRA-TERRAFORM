@@ -63,14 +63,24 @@ jobs:
           TASK_DEF_FAMILY: ${{ env.ECS_TASK_DEFINITION }}
         run: |
           echo "Downloading task definition for: $TASK_DEF_FAMILY"
-          # Add error handling
-          if ! aws ecs describe-task-definition \
+          
+          # First, get ECR registry URL
+          ECR_REGISTRY=$(aws ecr describe-repositories \
+            --repository-names "$ECR_REPOSITORY" \
+            --query 'repositories[0].repositoryUri' \
+            --output text | cut -d'/' -f1)
+          
+          # Try to download existing task definition
+          if aws ecs describe-task-definition \
             --task-definition "$TASK_DEF_FAMILY" \
             --query taskDefinition \
             > task-definition.json 2>/dev/null; then
-            echo "❌ Failed to download task definition"
-            echo "Creating a basic task definition template..."
-            cat > task-definition.json << EOF
+            echo "✅ Downloaded existing task definition"
+          else
+            echo "❌ Task definition not found, creating template..."
+            
+            # Create basic task definition
+            cat > task-definition.json << 'EOF'
             {
               "family": "$TASK_DEF_FAMILY",
               "networkMode": "awsvpc",
@@ -80,7 +90,7 @@ jobs:
               "containerDefinitions": [
                 {
                   "name": "$ECS_SERVICE",
-                  "image": "${{ steps.login-ecr.outputs.registry }}/$ECR_REPOSITORY:latest",
+                  "image": "$ECR_REGISTRY/$ECR_REPOSITORY:latest",
                   "essential": true,
                   "portMappings": [
                     {
@@ -92,6 +102,14 @@ jobs:
               ]
             }
             EOF
+            
+            # Now replace the variables in the JSON
+            sed -i "s|\$TASK_DEF_FAMILY|$TASK_DEF_FAMILY|g" task-definition.json
+            sed -i "s|\$ECS_SERVICE|$ECS_SERVICE|g" task-definition.json
+            sed -i "s|\$ECR_REGISTRY|$ECR_REGISTRY|g" task-definition.json
+            sed -i "s|\$ECR_REPOSITORY|$ECR_REPOSITORY|g" task-definition.json
+            
+            echo "✅ Created new task definition template"
           fi
           
           echo "✅ Task definition ready"
