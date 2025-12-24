@@ -1,27 +1,29 @@
-name: Manual Deploy Specific Tag
+name: Build, Push, and Deploy to ECS
 
 on:
-  workflow_dispatch:
-    inputs:
-      image_tag:
-        description: 'Docker image tag to deploy'
-        required: true
-        default: 'latest'
-      task_definition_family:
-        description: 'Task definition family name'
-        required: true
-        default: 'myapp-poc'
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:  # Manual trigger
 
 env:
   AWS_REGION: ${{ secrets.AWS_REGION }}
   ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY_NAME }}
   ECS_CLUSTER: ${{ secrets.ECS_CLUSTER_NAME }}
   ECS_SERVICE: ${{ secrets.ECS_SERVICE_NAME }}
+  # Use service name as default if task definition secret not set
+  ECS_TASK_DEFINITION: ${{ secrets.ECS_TASK_DEFINITION || secrets.ECS_SERVICE_NAME }}
 
 jobs:
-  deploy-tag:
+  build-and-deploy:
+    name: Build, Push, and Deploy
     runs-on: ubuntu-latest
+    
     steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -29,63 +31,105 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Deploy specific tag to ECS
-        env:
-          IMAGE_TAG: ${{ github.event.inputs.image_tag }}
-          TASK_DEF_FAMILY: ${{ github.event.inputs.task_definition_family }}
-        run: |
-          # Get ECR registry URL
-          ECR_REGISTRY=$(aws ecr describe-repositories \
-            --repository-names $ECR_REPOSITORY \
-            --query 'repositories[0].repositoryUri' \
-            --output text | cut -d'/' -f1)
-          
-          IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
-          echo "🚀 Deploying image: $IMAGE"
-          echo "📝 Task definition family: $TASK_DEF_FAMILY"
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
 
-          # Download current task definition
-          echo "📥 Downloading current task definition..."
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build, tag, and push image to Amazon ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          # Build the Docker image
+          docker build -t $ECR_REPOSITORY:$IMAGE_TAG -f Dockerfile .
+          
+          # Tag for ECR
+          docker tag $ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          
+          # Push to ECR
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          
+          # Also tag as latest
+          docker tag $ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+          echo "image_latest=$ECR_REGISTRY/$ECR_REPOSITORY:latest" >> $GITHUB_OUTPUT
+          echo "Pushed image: $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+
+      - name: Download current ECS task definition
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')
+        env:
+          TASK_DEF_FAMILY: ${{ env.ECS_TASK_DEFINITION }}
+        run: |
+          echo "Downloading task definition for: $TASK_DEF_FAMILY"
           aws ecs describe-task-definition \
             --task-definition "$TASK_DEF_FAMILY" \
             --query taskDefinition \
             > task-definition.json
           
+          echo "Current task definition downloaded"
+
+      - name: Update ECS task definition with new image
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')
+        env:
+          IMAGE: ${{ steps.build-image.outputs.image }}
+        run: |
+          echo "Updating task definition with image: $IMAGE"
+          
           # Update image in task definition
-          echo "🔄 Updating image in task definition..."
           jq ".containerDefinitions[0].image = \"$IMAGE\"" task-definition.json > updated-task-definition.json
           
-          # ⭐ FIX: Remove invalid fields before registering ⭐
-          echo "🧹 Cleaning task definition (removing invalid fields)..."
-          jq 'del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)' \
-            updated-task-definition.json > clean-task-definition.json
+          # Remove invalid fields for register-task-definition
+          jq 'del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)' updated-task-definition.json > clean-task-definition.json
           
           # Register new task definition
-          echo "📝 Registering new task definition..."
-          aws ecs register-task-definition \
-            --cli-input-json file://clean-task-definition.json
+          NEW_TASK_DEF=$(aws ecs register-task-definition \
+            --cli-input-json file://clean-task-definition.json \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
           
-          # Get the latest revision number
-          echo "🔍 Getting latest revision..."
-          LATEST_REVISION=$(aws ecs describe-task-definition \
+          echo "✅ New task definition registered: $NEW_TASK_DEF"
+
+      - name: Deploy to ECS Service
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')
+        env:
+          TASK_DEF_FAMILY: ${{ env.ECS_TASK_DEFINITION }}
+        run: |
+          echo "Deploying to ECS: $ECS_CLUSTER / $ECS_SERVICE"
+          
+          # Get latest revision number
+          LATEST_REV=$(aws ecs describe-task-definition \
             --task-definition "$TASK_DEF_FAMILY" \
             --query 'taskDefinition.revision' \
             --output text)
           
-          echo "✅ New revision: $LATEST_REVISION"
+          echo "Using task definition: $TASK_DEF_FAMILY:$LATEST_REV"
           
-          # Update ECS service
-          echo "⚙️ Updating ECS service..."
+          # Update service with new task definition
           aws ecs update-service \
             --cluster "$ECS_CLUSTER" \
             --service "$ECS_SERVICE" \
-            --task-definition "$TASK_DEF_FAMILY:$LATEST_REVISION"
+            --task-definition "$TASK_DEF_FAMILY:$LATEST_REV"
           
-          echo "🎉 Deployment initiated successfully!"
+          echo "✅ Deployment initiated for ECS service"
           
-          # Show deployment status
-          echo "📊 Checking deployment status..."
+          # Wait for service to stabilize (optional)
+          echo "Waiting for service to stabilize..."
+          timeout 300 bash -c 'while [[ $(aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" --query "services[0].deployments[0].runningCount" --output text) -lt 1 ]]; do sleep 10; done' || echo "Service might still be starting"
+          
+          echo "🎉 Deployment completed!"
+
+      - name: Check deployment status
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          echo "Checking deployment status..."
           aws ecs describe-services \
             --cluster "$ECS_CLUSTER" \
             --services "$ECS_SERVICE" \
-            --query 'services[0].deployments[0]'
+            --query 'services[0].{status: status, desired: desiredCount, running: runningCount, deployments: deployments}' \
+            --output json

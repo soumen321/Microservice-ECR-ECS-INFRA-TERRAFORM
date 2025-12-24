@@ -14,12 +14,33 @@ resource "aws_iam_role" "ecs_task_execution" {
   })
 }
 
+# Standard ECS execution policy
 resource "aws_iam_role_policy_attachment" "ecs_task_execution" {
   role       = aws_iam_role.ecs_task_execution.name
   policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
 }
 
-# IAM User for GitHub Actions (Manual ECR push)
+# Secrets Manager access for weather API key
+resource "aws_iam_policy" "secrets_access" {
+  name        = "${var.project_name}-secrets-access"
+  description = "Allow ECS to read weather API secret"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = "secretsmanager:GetSecretValue"
+      Resource = "arn:aws:secretsmanager:${var.aws_region}:${data.aws_caller_identity.current.account_id}:secret:${var.project_name}-${var.environment}-weather-api-key"
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "secrets_access" {
+  role       = aws_iam_role.ecs_task_execution.name
+  policy_arn = aws_iam_policy.secrets_access.arn
+}
+
+# GitHub Actions IAM User (unchanged from your code)
 resource "aws_iam_user" "github_actions" {
   name = "${var.project_name}-${var.environment}-github-actions"
 }
@@ -52,15 +73,7 @@ resource "aws_iam_user_policy" "github_actions_ecr" {
           "ecr:PutImage"
         ]
         Resource = "*"
-      },
-      {
-        Effect = "Allow"
-        Action = [
-          "ecr:GetAuthorizationToken"
-        ]
-        Resource = "*"
-      },
-      
+      }
     ]
   })
 }

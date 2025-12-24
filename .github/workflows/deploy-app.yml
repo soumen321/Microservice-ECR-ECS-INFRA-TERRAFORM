@@ -12,7 +12,8 @@ env:
   ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY_NAME }}
   ECS_CLUSTER: ${{ secrets.ECS_CLUSTER_NAME }}
   ECS_SERVICE: ${{ secrets.ECS_SERVICE_NAME }}
-  ECS_TASK_DEFINITION: ${{ secrets.ECS_TASK_DEFINITION }}
+  # Use service name as default if task definition secret not set
+  ECS_TASK_DEFINITION: ${{ secrets.ECS_TASK_DEFINITION || secrets.ECS_SERVICE_NAME }}
 
 jobs:
   build-and-deploy:
@@ -33,9 +34,6 @@ jobs:
       - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
 
       - name: Build, tag, and push image to Amazon ECR
         id: build-image
@@ -62,15 +60,41 @@ jobs:
       - name: Download current ECS task definition
         if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')
         env:
-          TASK_DEF_FAMILY: ${{ secrets.ECS_TASK_DEFINITION || env.ECS_SERVICE }}
+          TASK_DEF_FAMILY: ${{ env.ECS_TASK_DEFINITION }}
         run: |
           echo "Downloading task definition for: $TASK_DEF_FAMILY"
-          aws ecs describe-task-definition \
+          # Add error handling
+          if ! aws ecs describe-task-definition \
             --task-definition "$TASK_DEF_FAMILY" \
             --query taskDefinition \
-            > task-definition.json
+            > task-definition.json 2>/dev/null; then
+            echo "❌ Failed to download task definition"
+            echo "Creating a basic task definition template..."
+            cat > task-definition.json << EOF
+            {
+              "family": "$TASK_DEF_FAMILY",
+              "networkMode": "awsvpc",
+              "requiresCompatibilities": ["FARGATE"],
+              "cpu": "256",
+              "memory": "512",
+              "containerDefinitions": [
+                {
+                  "name": "$ECS_SERVICE",
+                  "image": "${{ steps.login-ecr.outputs.registry }}/$ECR_REPOSITORY:latest",
+                  "essential": true,
+                  "portMappings": [
+                    {
+                      "containerPort": 8080,
+                      "protocol": "tcp"
+                    }
+                  ]
+                }
+              ]
+            }
+            EOF
+          fi
           
-          echo "Current task definition downloaded"
+          echo "✅ Task definition ready"
 
       - name: Update ECS task definition with new image
         if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')
@@ -86,40 +110,94 @@ jobs:
           jq 'del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)' updated-task-definition.json > clean-task-definition.json
           
           # Register new task definition
-          aws ecs register-task-definition \
-            --cli-input-json file://clean-task-definition.json
-          
-          echo "✅ New task definition registered"
+          if NEW_TASK_DEF=$(aws ecs register-task-definition \
+            --cli-input-json file://clean-task-definition.json \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text); then
+            echo "✅ New task definition registered: $NEW_TASK_DEF"
+          else
+            echo "❌ Failed to register task definition"
+            exit 1
+          fi
 
       - name: Deploy to ECS Service
         if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')
         env:
-          TASK_DEF_FAMILY: ${{ secrets.ECS_TASK_DEFINITION || env.ECS_SERVICE }}
+          TASK_DEF_FAMILY: ${{ env.ECS_TASK_DEFINITION }}
         run: |
           echo "Deploying to ECS: $ECS_CLUSTER / $ECS_SERVICE"
           
+          # Get latest revision number
+          if ! LATEST_REV=$(aws ecs describe-task-definition \
+            --task-definition "$TASK_DEF_FAMILY" \
+            --query 'taskDefinition.revision' \
+            --output text 2>/dev/null); then
+            echo "⚠️ Could not get latest revision, using family name only"
+            LATEST_REV=""
+          fi
+          
+          if [[ -n "$LATEST_REV" ]]; then
+            TASK_DEF_TO_USE="$TASK_DEF_FAMILY:$LATEST_REV"
+            echo "Using task definition: $TASK_DEF_TO_USE"
+          else
+            TASK_DEF_TO_USE="$TASK_DEF_FAMILY"
+            echo "Using task definition: $TASK_DEF_TO_USE (no revision)"
+          fi
+          
           # Update service with new task definition
-          aws ecs update-service \
+          if aws ecs update-service \
             --cluster "$ECS_CLUSTER" \
             --service "$ECS_SERVICE" \
-            --task-definition "$TASK_DEF_FAMILY" \
-            --force-new-deployment
-          
-          echo "✅ Deployment initiated for ECS service"
-          
-          # Wait for service to stabilize (optional)
-          echo "Waiting for service to stabilize..."
-          aws ecs wait services-stable \
-            --cluster "$ECS_CLUSTER" \
-            --services "$ECS_SERVICE" \
-            --no-paginate || echo "Service stabilization check completed"
+            --task-definition "$TASK_DEF_TO_USE"; then
+            echo "✅ Deployment initiated for ECS service"
+          else
+            echo "❌ Failed to update ECS service"
+            exit 1
+          fi
 
       - name: Check deployment status
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')
         run: |
           echo "Checking deployment status..."
+          MAX_WAIT=300  # 5 minutes
+          INTERVAL=10
+          ELAPSED=0
+          
+          while [[ $ELAPSED -lt $MAX_WAIT ]]; do
+            STATUS=$(aws ecs describe-services \
+              --cluster "$ECS_CLUSTER" \
+              --services "$ECS_SERVICE" \
+              --query 'services[0].deployments[0].status' \
+              --output text 2>/dev/null || echo "UNKNOWN")
+            
+            RUNNING=$(aws ecs describe-services \
+              --cluster "$ECS_CLUSTER" \
+              --services "$ECS_SERVICE" \
+              --query 'services[0].runningCount' \
+              --output text 2>/dev/null || echo "0")
+            
+            DESIRED=$(aws ecs describe-services \
+              --cluster "$ECS_CLUSTER" \
+              --services "$ECS_SERVICE" \
+              --query 'services[0].desiredCount' \
+              --output text 2>/dev/null || echo "0")
+            
+            echo "Status: $STATUS, Running: $RUNNING/$DESIRED, Elapsed: ${ELAPSED}s"
+            
+            if [[ "$STATUS" == "PRIMARY" && "$RUNNING" == "$DESIRED" && "$RUNNING" -gt 0 ]]; then
+              echo "🎉 Deployment successful!"
+              exit 0
+            fi
+            
+            sleep $INTERVAL
+            ELAPSED=$((ELAPSED + INTERVAL))
+          done
+          
+          echo "⚠️ Deployment timed out after $MAX_WAIT seconds"
+          echo "Current state:"
           aws ecs describe-services \
             --cluster "$ECS_CLUSTER" \
             --services "$ECS_SERVICE" \
-            --query 'services[0].deployments' \
-            --output table
+            --query 'services[0]' \
+            --output json
+          exit 1
