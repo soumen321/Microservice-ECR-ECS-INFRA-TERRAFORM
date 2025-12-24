@@ -1,4 +1,4 @@
-name: Build and Push to ECR
+name: Build, Push, and Deploy to ECS
 
 on:
   push:
@@ -10,10 +10,13 @@ on:
 env:
   AWS_REGION: ${{ secrets.AWS_REGION }}
   ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY_NAME }}
+  ECS_CLUSTER: ${{ secrets.ECS_CLUSTER_NAME }}
+  ECS_SERVICE: ${{ secrets.ECS_SERVICE_NAME }}
+  ECS_TASK_DEFINITION: ${{ secrets.ECS_TASK_DEFINITION }}
 
 jobs:
-  build-and-push:
-    name: Build Docker image and push to ECR
+  build-and-deploy:
+    name: Build, Push, and Deploy
     runs-on: ubuntu-latest
     
     steps:
@@ -35,6 +38,7 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Build, tag, and push image to Amazon ECR
+        id: build-image
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           IMAGE_TAG: ${{ github.sha }}
@@ -52,13 +56,70 @@ jobs:
           docker tag $ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
           
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
           echo "Pushed image: $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
 
-      - name: Update ECS Service (Optional)
+      - name: Download current ECS task definition
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')
+        env:
+          TASK_DEF_FAMILY: ${{ secrets.ECS_TASK_DEFINITION || env.ECS_SERVICE }}
+        run: |
+          echo "Downloading task definition for: $TASK_DEF_FAMILY"
+          aws ecs describe-task-definition \
+            --task-definition "$TASK_DEF_FAMILY" \
+            --query taskDefinition \
+            > task-definition.json
+          
+          echo "Current task definition downloaded"
+
+      - name: Update ECS task definition with new image
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')
+        env:
+          IMAGE: ${{ steps.build-image.outputs.image }}
+        run: |
+          echo "Updating task definition with image: $IMAGE"
+          
+          # Update image in task definition
+          jq ".containerDefinitions[0].image = \"$IMAGE\"" task-definition.json > updated-task-definition.json
+          
+          # Remove invalid fields for register-task-definition
+          jq 'del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)' updated-task-definition.json > clean-task-definition.json
+          
+          # Register new task definition
+          aws ecs register-task-definition \
+            --cli-input-json file://clean-task-definition.json
+          
+          echo "✅ New task definition registered"
+
+      - name: Deploy to ECS Service
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')
+        env:
+          TASK_DEF_FAMILY: ${{ secrets.ECS_TASK_DEFINITION || env.ECS_SERVICE }}
+        run: |
+          echo "Deploying to ECS: $ECS_CLUSTER / $ECS_SERVICE"
+          
+          # Update service with new task definition
+          aws ecs update-service \
+            --cluster "$ECS_CLUSTER" \
+            --service "$ECS_SERVICE" \
+            --task-definition "$TASK_DEF_FAMILY" \
+            --force-new-deployment
+          
+          echo "✅ Deployment initiated for ECS service"
+          
+          # Wait for service to stabilize (optional)
+          echo "Waiting for service to stabilize..."
+          aws ecs wait services-stable \
+            --cluster "$ECS_CLUSTER" \
+            --services "$ECS_SERVICE" \
+            --no-paginate || echo "Service stabilization check completed"
+
+      - name: Check deployment status
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: |
-          # Force new deployment to pick up latest image
-          aws ecs update-service \
-            --cluster ${{ secrets.ECS_CLUSTER_NAME }} \
-            --service ${{ secrets.ECS_SERVICE_NAME }} \
-            --force-new-deployment
+          echo "Checking deployment status..."
+          aws ecs describe-services \
+            --cluster "$ECS_CLUSTER" \
+            --services "$ECS_SERVICE" \
+            --query 'services[0].deployments' \
+            --output table
