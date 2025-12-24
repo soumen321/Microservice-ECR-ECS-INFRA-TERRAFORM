@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+python-dotenv
+pybreaker
+requests
+httpx
+slowapi
+pydantic
+loadenv
