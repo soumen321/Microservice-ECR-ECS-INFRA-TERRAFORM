@@ -1,6 +1,7 @@
 
 # Weather Forcast Micro Service 
 
+
 ## Why need weather service
  1. Real-time weather alert
  2. Short-term forecast
@@ -24,3 +25,8 @@
 
 ### Browser
 - http://127.0.0.1:9000/docs
+
+### Create infra 
+
+- ECR - ECS - LB - SECRECT MANAGER
+- github action run the workflow and tag and upload image in ecr registry
